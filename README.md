@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://github.com/Fede5/avd-CICD/raw/main/avdcicd-banner.png" alt="Banner" />
+</p>
+
 # AVD Session Host Rolling Update via CI/CD 🚀
 
 ![Azure](https://img.shields.io/badge/Azure-0078D4?logo=microsoftazure&logoColor=white)
