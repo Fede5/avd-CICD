@@ -1,0 +1,380 @@
+# avd-host-update-pipeline.yml
+
+# Trigger por Event Grid (Requiere configuración en Service Hooks)
+# La definición del trigger es más declarativa en la UI de Service Hooks
+# Aquí definimos los recursos para que el pipeline pueda procesar el payload
+resources:
+  webhooks:
+    - webhook: ACGImageWebhook # Nombre interno para el webhook
+      connection: ACGEventGridConnection # Nombre de la conexión 'Incoming Webhook' en Service Hooks
+
+variables:
+  # --- Configuración General ---
+  azureServiceConnection: 'TuAzureServiceConnection'
+  keyVaultName: 'tu-kv-$(environment)' # Asegúrate que el environment sea correcto o usa uno fijo
+  # --- AVD Host Pool Info (Necesario para buscar hosts) ---
+  hostPoolName: 'tu-avd-hp' # ¡¡ACTUALIZA!! Nombre del Host Pool existente
+  hostPoolResourceGroup: 'rg-avd-infra' # ¡¡ACTUALIZA!! RG del Host Pool
+  # --- Info para crear nuevos hosts ---
+  sessionHostResourceGroup: 'rg-avd-vms' # ¡¡ACTUALIZA!! RG donde residen/se crearán las VMs
+  location: 'eastus' # Ubicación de los hosts
+  prefix: 'avdprod-vm' # Prefijo para NUEVOS hosts (puede ser el mismo que los viejos)
+  vmSize: 'Standard_D4s_v3'
+  adminUsername: 'localadmin'
+  vmAdminPasswordSecretName: 'vmAdminPassword' # Nombre del secreto en KV
+  domainJoinPasswordSecretName: 'avdDomainJoinPassword' # Nombre del secreto en KV
+  existingVnetName: 'vnet-prod-eus' # ¡¡ACTUALIZA!!
+  existingSubnetName: 'snet-avd-prod-eus' # ¡¡ACTUALIZA!!
+  existingVnetResourceGroupName: 'rg-network-prod-eus' # ¡¡ACTUALIZA!!
+  domainToJoin: 'prod.contoso.com' # ¡¡ACTUALIZA!!
+  domainUsername: 'svc_prod_join@prod.contoso.com' # ¡¡ACTUALIZA!!
+  domainOuPath: 'OU=AVD-Prod,DC=prod,DC=contoso,DC=com' # ¡¡ACTUALIZA!! (Opcional)
+  logAnalyticsWorkspaceId: '/subscriptions/.../workspaces/...' # ¡¡ACTUALIZA!! ID completo del LA Workspace
+  availabilitySetName: '$(prefix)-as' # Nombre del AS (puede ser el mismo)
+  # --- Script y Token ---
+  avdAgentScriptUrl: 'URL_A_TU_SCRIPT/InstallAvdAgent.ps1' # ¡¡ACTUALIZA!!
+  avdTokenSecretName: 'avd-hostpool-registration-token' # Nombre del secreto donde guardar/leer el token
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: PrepareUpdate
+  displayName: '1. Get Image Info & Identify Old Hosts'
+  jobs:
+  - job: GatherInfo
+    displayName: 'Process Trigger and Query Azure'
+    steps:
+    - checkout: none # No necesitamos código fuente en esta etapa inicial
+
+    - script: |
+        sudo apt-get update && sudo apt-get install -y jq # Instalar jq
+        echo "Event Grid Payload:"
+        # El payload del webhook está disponible como variable $(resources.webhook.ACGImageWebhook.event.data)
+        # Necesita mapeo o acceso directo dependiendo de la configuración exacta del webhook/trigger
+        # Vamos a asumir que está en una variable predefinida o se pasa de otra forma
+        # Para prueba, puedes hardcodear el ID de la nueva imagen aquí:
+        # newImageVersionId="/subscriptions/abc.../resourceGroups/rg-images/providers/Microsoft.Compute/galleries/myGallery/images/win11avd/versions/1.0.1"
+        # echo "##vso[task.setvariable variable=newImageVersionId;isOutput=true]$newImageVersionId"
+
+        # --- PARSE EVENT GRID PAYLOAD (Ejemplo - Ajustar según payload real) ---
+        # El payload real estará en una variable como $(eventPayload) o similar
+        # echo "$(eventPayload)" | jq '.' # Imprime el payload para debug
+        # newImageVersionId=$(echo "$(eventPayload)" | jq -r '.data.galleryImageVersionResourceId') # Extrae el ID
+
+        # --- ***Placeholder: Asigna manualmente el ID de la nueva imagen para este ejemplo*** ---
+        # ¡¡DEBES reemplazar esto con el parseo real del evento o una forma de obtener el ID!!
+        newImageVersionId="/subscriptions/YOUR_SUB/resourceGroups/YOUR_IMG_RG/providers/Microsoft.Compute/galleries/YOUR_GALLERY/images/YOUR_IMG_DEF/versions/YOUR_NEW_VERSION"
+        echo "Identified New Image Version ID: $newImageVersionId"
+        if [ -z "$newImageVersionId" ] || [ "$newImageVersionId" == "null" ]; then
+          echo "##vso[task.logissue type=error]Could not determine new Image Version ID from trigger."
+          exit 1
+        fi
+        echo "##vso[task.setvariable variable=newImageVersionId;isOutput=true]$newImageVersionId"
+
+      displayName: 'Parse Event Grid Trigger (Placeholder)' # ¡Implementar parseo real!
+
+    - task: AzureCLI@2
+      name: QueryHostsTask
+      displayName: 'Query Existing Hosts & Identify Old Ones'
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          set -e # Salir en caso de error
+          newImageId="$(newImageVersionId)" # Obtener ID de la imagen nueva del paso anterior
+
+          echo "Querying session hosts in Host Pool: $(hostPoolName) / RG: $(hostPoolResourceGroup)"
+          # Obtener todos los hosts activos o no disponibles (excluyendo desconectados que podrían estar en mantenimiento)
+          hostsJson=$(az desktopvirtualization session-host list --resource-group "$(hostPoolResourceGroup)" --host-pool-name "$(hostPoolName)" --query "[?status=='Available' || status=='Unavailable'].{name:name, id:id, resourceId:resourceId}" -o json)
+
+          if [ -z "$hostsJson" ] || [ "$hostsJson" == "[]" ]; then
+            echo "No active session hosts found in the pool. Nothing to update."
+            echo "##vso[task.setvariable variable=oldHostIds;isOutput=true][]" # Pasar array vacío
+            exit 0
+          fi
+
+          echo "Identifying hosts with outdated images..."
+          oldHostIds="[]" # Inicializa un array JSON
+
+          # Iterar sobre los resource IDs de las VMs asociadas a los session hosts
+          vmResourceIds=$(echo $hostsJson | jq -r '.[].resourceId | select(.!=null)')
+
+          for vmId in $vmResourceIds; do
+            echo "Checking VM: $vmId"
+            # Obtener las etiquetas de la VM
+            vmTagsJson=$(az resource show --ids "$vmId" --query "tags" -o json)
+            if [ -z "$vmTagsJson" ] || [ "$vmTagsJson" == "{}" ]; then
+              echo "WARNING: VM $vmId has no tags. Assuming it needs update (or implement different logic)."
+              # Decide qué hacer: actualizar si no tiene tag, o ignorar? Por ahora, lo incluimos.
+              sessionHostId=$(echo $hostsJson | jq -r ".[] | select(.resourceId==\"$vmId\").id") # Encuentra el session host ID asociado
+              oldHostIds=$(echo $oldHostIds | jq --arg id "$sessionHostId" '. += [$id]')
+              continue # Pasa al siguiente VM
+            fi
+
+            # Obtener el ID de la imagen de origen de la etiqueta
+            sourceImageId=$(echo $vmTagsJson | jq -r '.sourceImageVersionId') # Ajusta el nombre de la etiqueta si es diferente
+
+            if [ -z "$sourceImageId" ] || [ "$sourceImageId" == "null" ]; then
+               echo "WARNING: VM $vmId is missing the 'sourceImageVersionId' tag. Assuming it needs update."
+               sessionHostId=$(echo $hostsJson | jq -r ".[] | select(.resourceId==\"$vmId\").id")
+               oldHostIds=$(echo $oldHostIds | jq --arg id "$sessionHostId" '. += [$id]')
+            elif [ "$sourceImageId" != "$newImageId" ]; then
+               echo "VM $vmId needs update (Current: $sourceImageId, New: $newImageId)"
+               sessionHostId=$(echo $hostsJson | jq -r ".[] | select(.resourceId==\"$vmId\").id")
+               oldHostIds=$(echo $oldHostIds | jq --arg id "$sessionHostId" '. += [$id]')
+            else
+               echo "VM $vmId is up-to-date."
+            fi
+          done
+
+          echo "Session Host IDs identified for update: $(echo $oldHostIds | jq -c .)"
+          if [ "$(echo $oldHostIds | jq 'length')" -eq 0 ]; then
+             echo "All hosts are already using the latest image version ($newImageId)."
+          fi
+
+          # Pasar la lista de IDs de session host (no VM IDs) a la siguiente etapa
+          echo "##vso[task.setvariable variable=oldHostIds;isOutput=true]$(echo $oldHostIds | jq -c .)"
+
+
+- stage: UpdateHosts
+  displayName: '2. Rolling Update Session Hosts'
+  dependsOn: PrepareUpdate
+  # Mapear variables de la etapa anterior
+  variables:
+    newImageVersionId: $[ stageDependencies.PrepareUpdate.GatherInfo.outputs['QueryHostsTask.newImageVersionId'] ]
+    # oldHostIds es una cadena JSON con un array de IDs de Session Host
+    oldHostIdsJson: $[ stageDependencies.PrepareUpdate.GatherInfo.outputs['QueryHostsTask.oldHostIds'] ]
+  jobs:
+  # Job para generar el token AVD (similar al pipeline original)
+  - job: PrepareTokenAndSecrets
+    displayName: 'Get Secrets and AVD Token'
+    steps:
+      - task: AzureKeyVault@2
+        displayName: 'Download Domain/Admin Passwords'
+        inputs:
+          azureSubscription: $(azureServiceConnection)
+          KeyVaultName: $(keyVaultName)
+          SecretsFilter: '$(domainJoinPasswordSecretName),$(vmAdminPasswordSecretName)'
+          RunAsPreJob: false
+
+      - script: | # Validar descarga de contraseñas
+          echo "Validating downloaded passwords..."
+          domain_pw_secret_var_name=$(echo "$(domainJoinPasswordSecretName)" | sed 's/[^a-zA-Z0-9_]/_/g')
+          vm_admin_pw_secret_var_name=$(echo "$(vmAdminPasswordSecretName)" | sed 's/[^a-zA-Z0-9_]/_/g')
+          if [ -z "$(eval echo \$$domain_pw_secret_var_name)" ]; then echo "##vso[task.logissue type=error]Domain Join Password not downloaded."; exit 1; fi
+          if [ -z "$(eval echo \$$vm_admin_pw_secret_var_name)" ]; then echo "##vso[task.logissue type=error]VM Admin Password not downloaded."; exit 1; fi
+          echo "Password validation passed."
+        displayName: 'Verify Password Secrets Downloaded'
+
+      - task: AzureCLI@2 # Obtener/Actualizar Token AVD
+        name: GetTokenTask
+        displayName: 'Get/Update AVD Host Pool Registration Token'
+        inputs:
+          # ... (Lógica idéntica a la Tarea 1.3 del pipeline original para obtener token) ...
+          azureSubscription: $(azureServiceConnection)
+          scriptType: 'bash'
+          scriptLocation: 'inlineScript'
+          inlineScript: |
+            echo "Getting registration token for Host Pool: $(hostPoolName) / RG: $(hostPoolResourceGroup)"
+            expiration_date=$(date -u -d "+8 hours" --iso-8601=seconds) # Token válido por 8h
+            expiration_date="${expiration_date%+00:00}Z"
+            echo "Token expiration set to: ${expiration_date}"
+            token_output=$(az desktopvirtualization hostpool registration-info update --resource-group "$(hostPoolResourceGroup)" --host-pool-name "$(hostPoolName)" --expiration-time "${expiration_date}" -o json)
+            registration_token=$(echo "$token_output" | jq -r '.token')
+            if [[ -z "$registration_token" || "$registration_token" == "null" ]]; then echo "##vso[task.logissue type=error]Failed to retrieve registration token."; exit 1; fi
+            echo "Successfully retrieved registration token."
+            echo "##vso[task.setvariable variable=avdRegistrationToken;isOutput=true;isSecret=true]$registration_token"
+
+      - task: AzureCLI@2 # Guardar Token en KV
+        displayName: 'Store AVD Registration Token in Key Vault'
+        inputs:
+           # ... (Lógica idéntica a la Tarea 1.4 del pipeline original para guardar token) ...
+          azureSubscription: $(azureServiceConnection)
+          scriptType: 'bash'
+          scriptLocation: 'inlineScript'
+          env:
+            REGISTRATION_TOKEN: $(GetTokenTask.avdRegistrationToken)
+          inlineScript: |
+            echo "Storing registration token in Key Vault: $(keyVaultName), Secret Name: $(avdTokenSecretName)"
+            az keyvault secret set --vault-name "$(keyVaultName)" --name "$(avdTokenSecretName)" --value "$REGISTRATION_TOKEN"
+            if [ $? -ne 0 ]; then echo "##vso[task.logissue type=error]Failed to store token in Key Vault."; exit 1; fi
+            echo "Successfully stored token in Key Vault."
+
+  # Job que ejecuta la actualización, depende de que el token esté listo
+  - job: ExecuteRollingUpdate
+    displayName: 'Perform Rolling Update'
+    dependsOn: PrepareTokenAndSecrets
+    # Mapea las variables secretas descargadas en el job anterior
+    variables:
+      # Mapea las variables secretas descargadas de KV (el nombre es el nombre del secreto)
+      # La tarea AzureKeyVault@2 las hace disponibles automáticamente.
+      # Ejemplo: $(vmAdminPasswordSecretName) contendrá la contraseña admin.
+      # El token AVD se mapea desde la salida del job anterior
+      avdRegToken: $[ dependencies.PrepareTokenAndSecrets.outputs['GetTokenTask.avdRegistrationToken'] ]
+
+    steps:
+    - checkout: self # Necesitamos el código Bicep
+
+    - task: AzureCLI@2
+      displayName: 'Rolling Update Script'
+      timeoutInMinutes: 120 # Aumentar timeout para permitir drenaje/creación/eliminación
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        # Pasa variables y secretos como variables de entorno al script
+        env:
+          AZURE_DEVOPS_EXT_PAT: $(System.AccessToken) # Para posibles llamadas API DevOps si es necesario
+          HOST_POOL_NAME: $(hostPoolName)
+          HOST_POOL_RG: $(hostPoolResourceGroup)
+          SESSION_HOST_RG: $(sessionHostResourceGroup)
+          LOCATION: $(location)
+          VM_PREFIX: $(prefix)
+          VM_SIZE: $(vmSize)
+          ADMIN_USERNAME: $(adminUsername)
+          # Pasa los secretos descargados (nombres originales de KV)
+          VM_ADMIN_PASSWORD: $($(vmAdminPasswordSecretName))
+          DOMAIN_JOIN_PASSWORD: $($(domainJoinPasswordSecretName))
+          EXISTING_VNET_NAME: $(existingVnetName)
+          EXISTING_SUBNET_NAME: $(existingSubnetName)
+          EXISTING_VNET_RG: $(existingVnetResourceGroupName)
+          DOMAIN_TO_JOIN: $(domainToJoin)
+          DOMAIN_USERNAME: $(domainUsername)
+          DOMAIN_OU_PATH: $(domainOuPath)
+          LOG_ANALYTICS_ID: $(logAnalyticsWorkspaceId)
+          AVAILABILITY_SET_NAME: $(availabilitySetName)
+          NEW_IMAGE_ID: $(newImageVersionId) # ID de la nueva imagen
+          AVD_TOKEN: $(avdRegToken) # Token de registro AVD
+          AGENT_SCRIPT_URL: $(avdAgentScriptUrl)
+          # Lista JSON de IDs de Session Host a reemplazar
+          OLD_HOST_IDS_JSON: '$(oldHostIdsJson)' # Pasa como cadena JSON
+          # Tags (Construir JSON para Bicep)
+          TAGS_JSON: $(printf '{ "environment": "%s", "project": "AVD Session Host %s", "owner": "%s", "costCenter": "%s", "applicationName": "%s", "creationDate": "%s", "automationTool": "%s", "sourceImageVersionId": "%s" }' \
+            "$(environment)" "$(prefix)" "$(tagOwner)" "$(tagCostCenter)" "$(tagApplicationNameVMs)" "$(pipelineCreationDate)" "$(tagAutomationTool)" "$(newImageVersionId)")
+
+
+        inlineScript: |
+          #!/bin/bash
+          set -e # Salir en error
+
+          echo "Starting rolling update..."
+          echo "Host Pool: $HOST_POOL_NAME (RG: $HOST_POOL_RG)"
+          echo "New Image ID: $NEW_IMAGE_ID"
+
+          oldHostIds=$(echo "$OLD_HOST_IDS_JSON" | jq -r '.[]') # Extrae IDs del JSON
+
+          if [ -z "$oldHostIds" ]; then
+            echo "No hosts identified for update in the provided list. Exiting."
+            exit 0
+          fi
+
+          # --- Bucle de Actualización (uno por uno en este ejemplo) ---
+          hostIndex=0 # Puedes necesitar una lógica más robusta para encontrar el índice/nombre del nuevo host
+          for hostId in $oldHostIds; do
+            hostName=$(echo "$hostId" | awk -F'/' '{print $NF}') # Extrae nombre del ID
+            echo "-----------------------------------------------------"
+            echo "Processing Old Host: $hostName (ID: $hostId)"
+            echo "-----------------------------------------------------"
+
+            # 1. Poner en Modo Drenaje
+            echo "Enabling Drain Mode for $hostName..."
+            az desktopvirtualization session-host update --ids "$hostId" --allow-new-session false --output none || echo "WARN: Failed to set drain mode for $hostName (maybe already deleted?). Continuing..."
+
+            # 2. (Opcional) Esperar a que las sesiones se cierren (Lógica simple de espera/timeout)
+            echo "Waiting for active sessions to drain (max 15 minutes)..."
+            maxWait=900 # 15 minutos
+            elapsedWait=0
+            activeSessions=1 # Asumir 1 para entrar al bucle
+            while [ $activeSessions -gt 0 ] && [ $elapsedWait -lt $maxWait ]; do
+               sessionsJson=$(az desktopvirtualization user-session list --host-pool-name "$HOST_POOL_NAME" --resource-group "$HOST_POOL_RG" --query "[?sessionHostName=='$hostName']" -o json)
+               activeSessions=$(echo $sessionsJson | jq 'length')
+               if [ $activeSessions -gt 0 ]; then
+                 echo "  - $activeSessions active session(s) remaining on $hostName. Waiting 60s..."
+                 sleep 60
+                 elapsedWait=$((elapsedWait + 60))
+               else
+                 echo "  - No active sessions remaining on $hostName."
+               fi
+            done
+            if [ $activeSessions -gt 0 ]; then
+               echo "WARN: Timeout reached waiting for sessions on $hostName. Proceeding with replacement..."
+            fi
+
+            # 3. Crear Nuevo Host
+            # Determinar nombre/índice para el nuevo host (Aquí usamos un índice incremental simple)
+            # Podrías reusar el índice del host viejo si tienes esa info, o usar uniqueString
+            newVmName="${VM_PREFIX}-${hostIndex}"
+            echo "Creating new host $newVmName using image $NEW_IMAGE_ID..."
+
+            # Construir objeto de imagen para Bicep
+            # imageRefJson=$(printf '{ "id": "%s" }' "$NEW_IMAGE_ID") # Bicep >= 0.4.1 puede usar id directamente
+
+            # Desplegar Bicep para crear 1 VM
+            # NOTA: Pasamos AVD_TOKEN como parámetro seguro
+            deploymentName="avd-vm-update-$(Build.BuildId)-${hostIndex}"
+            az deployment group create --name "$deploymentName" \
+              --resource-group "$SESSION_HOST_RG" \
+              --template-file "avd-deployment/sessionhosts-update.bicep" \
+              --parameters \
+                prefix="$VM_PREFIX" \
+                location="$LOCATION" \
+                vmCount=1 \
+                vmSize="$VM_SIZE" \
+                adminUsername="$ADMIN_USERNAME" \
+                adminPassword="$VM_ADMIN_PASSWORD" \
+                existingVnetName="$EXISTING_VNET_NAME" \
+                existingSubnetName="$EXISTING_SUBNET_NAME" \
+                existingVnetResourceGroupName="$EXISTING_VNET_RG" \
+                domainToJoin="$DOMAIN_TO_JOIN" \
+                domainUsername="$DOMAIN_USERNAME" \
+                domainPassword="$DOMAIN_JOIN_PASSWORD" \
+                domainOuPath="$DOMAIN_OU_PATH" \
+                hostpoolToken="$AVD_TOKEN" \
+                hostPoolId="/subscriptions/$(az account show --query id -o tsv)/resourceGroups/$HOST_POOL_RG/providers/Microsoft.DesktopVirtualization/hostPools/$HOST_POOL_NAME" \
+                logAnalyticsWorkspaceId="$LOG_ANALYTICS_ID" \
+                galleryImageVersionId="$NEW_IMAGE_ID" \
+                availabilitySetName="$AVAILABILITY_SET_NAME" \
+                tags="$TAGS_JSON" \
+              --no-wait # Desplegar en segundo plano para seguir con el siguiente host si es necesario (o quitar --no-wait para secuencial)
+
+            # 4. (Si no usas --no-wait) Esperar a que el nuevo host esté listo (Opcional - Validación más robusta necesaria)
+            # echo "Waiting for new host $newVmName deployment..."
+            # az deployment group wait --name "$deploymentName" --resource-group "$SESSION_HOST_RG" --created
+
+            # echo "Checking AVD registration for $newVmName..."
+            # (Añadir lógica para verificar si el nuevo host aparece como 'Available' en AVD)
+
+            # 5. Eliminar Host Antiguo (Una vez que el nuevo está OK o después de un tiempo prudencial)
+            # ¡¡PRECAUCIÓN!! Asegúrate de que el nuevo host está funcional antes de borrar el viejo.
+            # En este ejemplo, borramos después de iniciar el despliegue del nuevo. Podrías mover esto
+            # a un job/stage separado o añadir validación robusta del nuevo host.
+            echo "Deleting old session host registration: $hostName..."
+            az desktopvirtualization session-host delete --ids "$hostId" --force --yes || echo "WARN: Failed to delete session host registration $hostName (maybe already deleted?)."
+
+            # Obtener el ID de la VM asociada al viejo session host para borrarla
+            vmIdToDelete=$(az desktopvirtualization session-host show --ids "$hostId" --query resourceId -o tsv)
+            if [ ! -z "$vmIdToDelete" ] && [ "$vmIdToDelete" != "null" ]; then
+              vmNameToDelete=$(echo "$vmIdToDelete" | awk -F'/' '{print $NF}')
+              vmRgToDelete=$(echo "$vmIdToDelete" | awk -F'/' '{print $5}') # Extrae RG del ID de VM
+              echo "Deleting VM: $vmNameToDelete (ID: $vmIdToDelete)..."
+              az vm delete --ids "$vmIdToDelete" --yes --force-deletion true || echo "WARN: Failed to delete VM $vmNameToDelete."
+
+              # Borrar NIC asociada (asume nombre = vmName-nic)
+              nicNameToDelete="${vmNameToDelete}-nic"
+              echo "Deleting NIC: $nicNameToDelete..."
+              az network nic delete --name "$nicNameToDelete" --resource-group "$vmRgToDelete" || echo "WARN: Failed to delete NIC $nicNameToDelete."
+              # Borrar Disco OS (asume nombre = vmName_OsDisk_1_...) - Requiere lógica más compleja para encontrar el nombre exacto
+              # osDiskId=$(az vm show --ids "$vmIdToDelete" --query "storageProfile.osDisk.managedDisk.id" -o tsv)
+              # if [ ! -z "$osDiskId" ]; then az disk delete --ids "$osDiskId" --yes; fi
+            else
+              echo "WARN: Could not find associated VM Resource ID for old host $hostName."
+            fi
+
+            hostIndex=$((hostIndex + 1)) # Incrementa índice para el siguiente host nuevo
+            echo "Completed processing for old host $hostName."
+
+          done # Fin del bucle for hostId
+
+          echo "Rolling update process finished."

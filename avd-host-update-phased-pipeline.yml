@@ -1,0 +1,330 @@
+# avd-host-update-phased-pipeline.yml
+
+# Trigger por Event Grid (Requiere configuración en Service Hooks)
+resources:
+  webhooks:
+    - webhook: ACGImageWebhook
+      connection: ACGEventGridConnection
+
+variables:
+  # --- Configuración General ---
+  azureServiceConnection: 'TuAzureServiceConnection'
+  keyVaultName: 'tu-kv-prod' # KV para secretos generales (o usa uno por env)
+  location: 'eastus' # Ubicación principal (ajustar si es necesario)
+  pipelineCreationDate: $[format('{0:yyyyMMddTHHmmssZ}', pipeline.startTime)]
+
+  # --- Identificación de Entornos ---
+  # Etiqueta usada en los RECURSOS de Host Pool para diferenciar Testing/Prod
+  environmentTagName: 'AVDEnvironment'
+  testingTagValue: 'Testing'
+  productionTagValue: 'Production'
+
+  # --- Configuración Base para VMs (Puede variar por Host Pool si es necesario) ---
+  sessionHostResourceGroup: 'rg-avd-vms-prod' # RG donde residen/se crearán las VMs (Ajustar si varía)
+  vmSize: 'Standard_D4s_v3'
+  adminUsername: 'localadmin'
+  vmAdminPasswordSecretName: 'vmAdminPassword' # Nombre del secreto en KV
+  domainJoinPasswordSecretName: 'avdDomainJoinPassword' # Nombre del secreto en KV
+  existingVnetName: 'vnet-prod-eus' # VNet por defecto (Ajustar si varía)
+  existingSubnetName: 'snet-avd-prod-eus' # Subnet por defecto (Ajustar si varía)
+  existingVnetResourceGroupName: 'rg-network-prod-eus' # RG de VNet por defecto (Ajustar si varía)
+  domainToJoin: 'prod.contoso.com' # Dominio por defecto (Ajustar si varía)
+  domainUsername: 'svc_prod_join@prod.contoso.com' # Usuario de unión por defecto (Ajustar si varía)
+  domainOuPath: 'OU=AVD-Prod,DC=prod,DC=contoso,DC=com' # OU por defecto (Opcional)
+  logAnalyticsWorkspaceId: '/subscriptions/.../workspaces/...' # LA Workspace ID por defecto (Ajustar si varía)
+  availabilitySetNamePrefix: 'avd-vm' # Prefijo para AS (ej: avd-vm-testing-as)
+  # --- Script y Token ---
+  avdAgentScriptUrl: 'URL_A_TU_SCRIPT/InstallAvdAgent.ps1' # ¡¡ACTUALIZA!!
+  avdTokenSecretName: 'avd-hostpool-registration-token' # Nombre secreto para guardar token
+
+  # --- Tags Base para Nuevas VMs ---
+  tagOwner: 'AVD-Admins'
+  tagCostCenter: 'IT-Shared-1234'
+  tagApplicationNameVMs: 'AVD Session Hosts'
+  tagAutomationTool: 'AzureDevOps-Bicep-Phased'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+
+# ========================================================================
+# STAGE 1: Preparar - Identificar Imagen y Clasificar Host Pools
+# ========================================================================
+- stage: PrepareUpdate
+  displayName: '1. Get Image & Classify Host Pools'
+  jobs:
+  - job: GatherInfo
+    displayName: 'Process Trigger and Query Azure'
+    steps:
+    - checkout: none # No code needed yet
+
+    - script: | # Instalar jq
+        sudo apt-get update && sudo apt-get install -y jq
+      displayName: 'Install jq'
+
+    - script: | # Parsear Evento (Placeholder - Implementar lógica real)
+        # --- ***Placeholder: Asigna manualmente el ID de la nueva imagen para este ejemplo*** ---
+        # ¡¡DEBES reemplazar esto con el parseo real del evento!!
+        newImageVersionId="/subscriptions/YOUR_SUB/resourceGroups/YOUR_IMG_RG/providers/Microsoft.Compute/galleries/YOUR_GALLERY/images/YOUR_IMG_DEF/versions/YOUR_LATEST_VERSION"
+        echo "Identified New Image Version ID: $newImageVersionId"
+        if [ -z "$newImageVersionId" ] || [ "$newImageVersionId" == "null" ]; then exit 1; fi
+        echo "##vso[task.setvariable variable=newImageVersionId;isOutput=true]$newImageVersionId"
+      displayName: 'Get New Image Version ID (Placeholder)'
+
+    - task: AzureCLI@2
+      name: ClassifyPoolsTask
+      displayName: 'Query & Classify Host Pools by Tag'
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          set -e
+          echo "Querying Host Pools and classifying by tag '$(environmentTagName)'..."
+          # Consulta todos los host pools y sus tags (ajusta el filtro si es necesario)
+          allPoolsJson=$(az desktopvirtualization hostpool list --query "[].{id:id, name:name, resourceGroup:resourceGroup, tags:tags}" -o json)
+
+          testingPools='[]'
+          productionPools='[]'
+
+          echo "$allPoolsJson" | jq -c '.[]' | while read poolJson; do
+            poolName=$(echo $poolJson | jq -r '.name')
+            poolRg=$(echo $poolJson | jq -r '.resourceGroup')
+            poolEnvTag=$(echo $poolJson | jq -r ".tags.\"$(environmentTagName)\"") # Accede al tag específico
+
+            poolInfo=$(printf '{"name": "%s", "resourceGroup": "%s"}' "$poolName" "$poolRg")
+
+            if [ "$poolEnvTag" == "$(testingTagValue)" ]; then
+              echo " - Found Testing Pool: $poolName (RG: $poolRg)"
+              testingPools=$(echo $testingPools | jq --argjson info "$poolInfo" '. += [$info]')
+            elif [ "$poolEnvTag" == "$(productionTagValue)" ]; then
+              echo " - Found Production Pool: $poolName (RG: $poolRg)"
+              productionPools=$(echo $productionPools | jq --argjson info "$poolInfo" '. += [$info]')
+            else
+              echo " - Skipping Pool: $poolName (RG: $poolRg) - Tag '$(environmentTagName)' not found or value mismatch ('$poolEnvTag')."
+            fi
+          done
+
+          echo "Testing Pools identified: $(echo $testingPools | jq -c .)"
+          echo "Production Pools identified: $(echo $productionPools | jq -c .)"
+
+          # Pasar listas como strings JSON a las siguientes etapas
+          echo "##vso[task.setvariable variable=testingHostPoolsJson;isOutput=true]$(echo $testingPools | jq -c .)"
+          echo "##vso[task.setvariable variable=productionHostPoolsJson;isOutput=true]$(echo $productionPools | jq -c .)"
+
+
+# ========================================================================
+# STAGE 2: Desplegar en Entorno de TESTING
+# ========================================================================
+- stage: RolloutTesting
+  displayName: '2. Rollout to Testing Host Pools'
+  dependsOn: PrepareUpdate
+  # Mapear variables de la etapa anterior
+  variables:
+    newImageVersionId: $[ stageDependencies.PrepareUpdate.GatherInfo.outputs['ClassifyPoolsTask.newImageVersionId'] ]
+    testingHostPoolsJson: $[ stageDependencies.PrepareUpdate.GatherInfo.outputs['ClassifyPoolsTask.testingHostPoolsJson'] ]
+  # Condición: Solo ejecutar si hay pools de testing identificados
+  condition: and(succeeded('PrepareUpdate'), ne(variables['testingHostPoolsJson'], '[]'))
+  jobs:
+  # Usar plantilla para preparar token y secretos
+  - template: templates/prepare-secrets-job.yml # Plantilla para obtener secretos y token
+    parameters:
+      keyVaultName: $(keyVaultName)
+      azureServiceConnection: $(azureServiceConnection)
+      vmAdminPasswordSecretName: $(vmAdminPasswordSecretName)
+      domainJoinPasswordSecretName: $(domainJoinPasswordSecretName)
+      avdTokenSecretName: $(avdTokenSecretName)
+      # Pasa el Host Pool Name/RG del *primer* pool de testing para generar el token
+      # Asume que el token es válido para todos los pools en la misma suscripción/tenant.
+      # Necesita lógica para extraer el primer pool del JSON.
+      # hostPoolNameForToken: # Lógica para extraer de testingHostPoolsJson
+      # hostPoolResourceGroupForToken: # Lógica para extraer de testingHostPoolsJson
+
+  # Job para ejecutar el rollout en testing
+  - job: ExecuteRollout_Testing
+    displayName: 'Execute Rolling Update on Testing Pools'
+    dependsOn: PrepareSecretsJob # Nombre del job en la plantilla prepare-secrets-job.yml
+    # Mapea las variables/secretos del job anterior
+    variables:
+      # Mapea secretos descargados de KV
+      # Mapea token AVD del job anterior:
+      avdRegToken: $[ dependencies.PrepareSecretsJob.outputs['GetTokenTask.avdRegistrationToken'] ] # Ajustar nombre de tarea/output según plantilla
+    # Asocia este job al entorno de Testing (informativo)
+    environment: 'AVD-Testing-Hosts'
+    steps:
+    - checkout: self # Necesitamos el código Bicep y scripts
+
+    - task: AzureCLI@2
+      displayName: 'Rolling Update Script (Testing)'
+      timeoutInMinutes: 180 # Timeout más largo
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        env:
+          # Pasa todas las variables necesarias al script
+          # ... (variables generales: LOCATION, VM_SIZE, ADMIN_USERNAME, etc.)
+          VM_ADMIN_PASSWORD: $($(vmAdminPasswordSecretName))
+          DOMAIN_JOIN_PASSWORD: $($(domainJoinPasswordSecretName))
+          NEW_IMAGE_ID: $(newImageVersionId)
+          AVD_TOKEN: $(avdRegToken)
+          AGENT_SCRIPT_URL: $(avdAgentScriptUrl)
+          TARGET_POOLS_JSON: '$(testingHostPoolsJson)' # *** PASA LA LISTA DE POOLS DE TESTING ***
+          SESSION_HOST_RG: $(sessionHostResourceGroup)
+          # ... (VNet, Subnet, Domain, OU, LA Workspace ID, AS Name, Tags Base) ...
+          TAGS_BASE_JSON: $(printf '{ "environment": "%s", "project": "AVD Session Host", "owner": "%s", "costCenter": "%s", "applicationName": "%s", "creationDate": "%s", "automationTool": "%s" }' \
+             "$(testingTagValue)" "$(tagOwner)" "$(tagCostCenter)" "$(tagApplicationNameVMs)" "$(pipelineCreationDate)" "$(tagAutomationTool)")
+
+        inlineScript: |
+          #!/bin/bash
+          set -e
+          echo "Starting ROLLING UPDATE for TESTING pools..."
+          echo "Target Pools JSON: $TARGET_POOLS_JSON"
+          echo "New Image ID: $NEW_IMAGE_ID"
+
+          # --- *** Placeholder: Lógica de Rolling Update *** ---
+          # Este script debe:
+          # 1. Parsear TARGET_POOLS_JSON
+          # 2. Iterar por CADA Host Pool en la lista:
+          #    a. Obtener el Nombre y RG del Host Pool actual.
+          #    b. Consultar los Session Hosts de ESE pool.
+          #    c. Identificar hosts con imagen antigua en ESE pool.
+          #    d. Iterar por los hosts antiguos de ESE pool:
+          #       i.   Poner en modo Drenaje (az desktopvirtualization session-host update ... --ids <ID_HOST_ANTIGUO>)
+          #       ii.  (Opcional) Esperar drenaje de sesiones.
+          #       iii. Crear Nuevo Host:
+          #            - Determinar nombre/índice (ej: $(VM_PREFIX)-testing-${index})
+          #            - Construir objeto de Tags específico (añadiendo sourceImageVersionId=$NEW_IMAGE_ID)
+          #            - Ejecutar 'az deployment group create' usando 'sessionhosts-update.bicep'
+          #              pasando TODOS los parámetros necesarios (incluyendo nombre/RG del pool actual si afecta algo,
+          #              el AVD_TOKEN, NEW_IMAGE_ID, admin/domain passwords, network info, tags JSON, etc.)
+          #       iv.  (Recomendado) Esperar/Validar nuevo host.
+          #       v.   Eliminar Host Antiguo (az desktopvirtualization session-host delete, az vm delete, az network nic delete)
+          # --- Fin Placeholder ---
+
+          echo "Rolling update for TESTING pools finished."
+
+
+# ========================================================================
+# STAGE 3: Esperar Aprobación para Producción
+# ========================================================================
+- stage: WaitForProdApproval
+  displayName: '3. Wait for Production Approval'
+  dependsOn: RolloutTesting
+  # Condición: Ejecutar siempre que la etapa anterior tenga éxito (o se omita si no había pools de testing),
+  # Y SOLO si hay pools de producción identificados.
+  condition: and(succeededOrSkipped(), ne(stageDependencies.PrepareUpdate.GatherInfo.outputs['ClassifyPoolsTask.productionHostPoolsJson'], '[]'))
+  jobs:
+  - deployment: WaitForApproval # Job de tipo 'deployment' para usar Environments/Approvals
+    displayName: 'Manual Approval Gate for Production'
+    # Referencia al entorno con el check de aprobación configurado
+    environment: 'AVD-Production-Hosts'
+    strategy:
+      runOnce: # Estrategia simple, solo necesita pasar la aprobación
+        deploy:
+          steps:
+          - script: echo "Approval received (or check passed). Proceeding to Production rollout."
+            displayName: 'Approval Check Passed'
+
+
+# ========================================================================
+# STAGE 4: Desplegar en Entorno de PRODUCCIÓN
+# ========================================================================
+- stage: RolloutProduction
+  displayName: '4. Rollout to Production Host Pools'
+  dependsOn: WaitForProdApproval # Depende de la aprobación
+  # Mapear variables de la etapa PrepareUpdate
+  variables:
+    newImageVersionId: $[ stageDependencies.PrepareUpdate.GatherInfo.outputs['ClassifyPoolsTask.newImageVersionId'] ]
+    productionHostPoolsJson: $[ stageDependencies.PrepareUpdate.GatherInfo.outputs['ClassifyPoolsTask.productionHostPoolsJson'] ]
+  # Condición: Solo ejecutar si la aprobación tuvo éxito Y hay pools de producción
+  condition: and(succeeded('WaitForProdApproval'), ne(variables['productionHostPoolsJson'], '[]'))
+  jobs:
+  # Usar plantilla para preparar token y secretos (puede necesitar refrescar el token)
+  - template: templates/prepare-secrets-job.yml
+    parameters:
+      keyVaultName: $(keyVaultName)
+      azureServiceConnection: $(azureServiceConnection)
+      vmAdminPasswordSecretName: $(vmAdminPasswordSecretName)
+      domainJoinPasswordSecretName: $(domainJoinPasswordSecretName)
+      avdTokenSecretName: $(avdTokenSecretName)
+      # Pasa el Host Pool Name/RG del *primer* pool de producción para generar el token
+      # hostPoolNameForToken: # Lógica para extraer de productionHostPoolsJson
+      # hostPoolResourceGroupForToken: # Lógica para extraer de productionHostPoolsJson
+
+  # Job para ejecutar el rollout en producción
+  - job: ExecuteRollout_Production
+    displayName: 'Execute Rolling Update on Production Pools'
+    dependsOn: PrepareSecretsJob_Prod # Ajustar nombre del job en la plantilla
+    variables:
+      avdRegToken: $[ dependencies.PrepareSecretsJob_Prod.outputs['GetTokenTask.avdRegistrationToken'] ] # Ajustar nombre de tarea/output según plantilla
+    # Asocia al entorno de Producción
+    environment: 'AVD-Production-Hosts' # Puede ser el mismo que la puerta de aprobación
+    steps:
+    - checkout: self
+
+    - task: AzureCLI@2
+      displayName: 'Rolling Update Script (Production)'
+      timeoutInMinutes: 360 # Timeout más largo para producción
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        env:
+           # Pasa todas las variables necesarias al script
+          # ... (variables generales: LOCATION, VM_SIZE, ADMIN_USERNAME, etc.)
+          VM_ADMIN_PASSWORD: $($(vmAdminPasswordSecretName))
+          DOMAIN_JOIN_PASSWORD: $($(domainJoinPasswordSecretName))
+          NEW_IMAGE_ID: $(newImageVersionId)
+          AVD_TOKEN: $(avdRegToken)
+          AGENT_SCRIPT_URL: $(avdAgentScriptUrl)
+          TARGET_POOLS_JSON: '$(productionHostPoolsJson)' # *** PASA LA LISTA DE POOLS DE PRODUCCIÓN ***
+          SESSION_HOST_RG: $(sessionHostResourceGroup)
+          # ... (VNet, Subnet, Domain, OU, LA Workspace ID, AS Name, Tags Base) ...
+          TAGS_BASE_JSON: $(printf '{ "environment": "%s", "project": "AVD Session Host", "owner": "%s", "costCenter": "%s", "applicationName": "%s", "creationDate": "%s", "automationTool": "%s" }' \
+             "$(productionTagValue)" "$(tagOwner)" "$(tagCostCenter)" "$(tagApplicationNameVMs)" "$(pipelineCreationDate)" "$(tagAutomationTool)")
+        inlineScript: |
+          #!/bin/bash
+          set -e
+          echo "Starting ROLLING UPDATE for PRODUCTION pools..."
+          echo "Target Pools JSON: $TARGET_POOLS_JSON"
+          echo "New Image ID: $NEW_IMAGE_ID"
+
+          # --- *** Placeholder: Lógica de Rolling Update (IDÉNTICA a la de Testing, pero con TARGET_POOLS_JSON diferente) *** ---
+          # Reutiliza la misma lógica que en la etapa de Testing para:
+          # 1. Parsear TARGET_POOLS_JSON (lista de pools de producción)
+          # 2. Iterar por CADA Host Pool de producción:
+          #    a. Identificar hosts antiguos en ese pool.
+          #    b. Iterar por los hosts antiguos:
+          #       i.   Drenar
+          #       ii.  (Opcional) Esperar
+          #       iii. Crear Nuevo Host (con Bicep, pasando params y tags correctos, incluyendo sourceImageVersionId)
+          #       iv.  (Recomendado) Esperar/Validar
+          #       v.   Eliminar Host Antiguo
+          # --- Fin Placeholder ---
+
+          echo "Rolling update for PRODUCTION pools finished."
+
+# ========================================================================
+# PLANTILLAS (Ejemplo - Crear archivos separados)
+# ========================================================================
+# Ejemplo de cómo se vería la plantilla 'templates/prepare-secrets-job.yml'
+# (Debes crear este archivo en tu repositorio)
+# parameters:
+# - name: keyVaultName type: string
+# - name: azureServiceConnection type: string
+# # ... otros parámetros necesarios ...
+#
+# jobs:
+# - job: PrepareSecretsJob # Nombre fijo del job dentro de la plantilla
+#   displayName: 'Get Secrets and AVD Token'
+#   steps:
+#   - task: AzureKeyVault@2
+#     # ... configuración ...
+#   - script: # Validar descarga ...
+#   - task: AzureCLI@2 # Obtener/Actualizar Token AVD
+#     name: GetTokenTask # Nombre fijo de la tarea para referenciar output
+#     # ... configuración ...
+#   - task: AzureCLI@2 # Guardar Token en KV
+#     # ... configuración ...
